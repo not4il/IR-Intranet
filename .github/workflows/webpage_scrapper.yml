@@ -1,0 +1,310 @@
+name: Web Page Scraper
+
+on:
+  workflow_dispatch:
+    inputs:
+      webpage_url:
+        description: 'URL of the web page to scrape'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  scrape-and-save:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Create scrapped directory if it doesn't exist
+      run: |
+        mkdir -p scrapped
+    
+    - name: Extract domain and timestamp
+      id: vars
+      run: |
+        URL="${{ github.event.inputs.webpage_url }}"
+        DOMAIN=$(echo "$URL" | awk -F/ '{print $3}' | sed 's/^www\.//')
+        TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+        FILENAME="${DOMAIN}_${TIMESTAMP}"
+        
+        echo "domain=$DOMAIN" >> $GITHUB_OUTPUT
+        echo "timestamp=$TIMESTAMP" >> $GITHUB_OUTPUT
+        echo "filename=$FILENAME" >> $GITHUB_OUTPUT
+        
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+    
+    - name: Install Playwright
+      run: |
+        npm install -D playwright
+        npx playwright install chromium
+    
+    - name: Create complete HTML with all resources
+      run: |
+        cat > scrape_complete.js << 'EOF'
+        const { chromium } = require('playwright');
+        const fs = require('fs');
+        const path = require('path');
+        
+        async function scrapeCompletePage(url, outputDir, baseFilename) {
+          const browser = await chromium.launch({
+            args: ['--disable-web-security']
+          });
+          const context = await browser.newContext({
+            viewport: { width: 1920, height: 1080 },
+            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+          });
+          const page = await context.newPage();
+          
+          try {
+            console.log('Loading page:', url);
+            
+            const imageUrls = new Set();
+            const fontUrls = new Set();
+            const cssUrls = new Set();
+            
+            await page.route('**/*', (route) => {
+              const request = route.request();
+              const resourceType = request.resourceType();
+              const requestUrl = request.url();
+              
+              if (resourceType === 'image') {
+                imageUrls.add(requestUrl);
+              } else if (resourceType === 'font') {
+                fontUrls.add(requestUrl);
+              } else if (resourceType === 'stylesheet') {
+                cssUrls.add(requestUrl);
+              }
+              
+              route.continue();
+            });
+            
+            await page.goto(url, { 
+              waitUntil: 'networkidle',
+              timeout: 60000 
+            });
+            
+            await page.waitForTimeout(2000);
+            
+            console.log('Scrolling to load lazy content...');
+            await page.evaluate(async () => {
+              await new Promise((resolve) => {
+                let totalHeight = 0;
+                const distance = 100;
+                const timer = setInterval(() => {
+                  const scrollHeight = document.body.scrollHeight;
+                  window.scrollBy(0, distance);
+                  totalHeight += distance;
+                  
+                  if (totalHeight >= scrollHeight) {
+                    clearInterval(timer);
+                    resolve();
+                  }
+                }, 100);
+              });
+            });
+            
+            await page.waitForTimeout(2000);
+            
+            console.log('Waiting for all images to load...');
+            await page.evaluate(() => {
+              return new Promise((resolve) => {
+                const images = Array.from(document.images);
+                let pendingImages = images.filter(img => !img.complete);
+                
+                if (pendingImages.length === 0) {
+                  resolve();
+                  return;
+                }
+                
+                console.log(`Waiting for ${pendingImages.length} images to load...`);
+                
+                let timeout = setTimeout(() => {
+                  console.log(`Timeout reached (10s), continuing with ${pendingImages.filter(img => !img.complete).length} images not loaded`);
+                  resolve();
+                }, 10000);
+                
+                let loadedCount = 0;
+                const totalPending = pendingImages.length;
+                
+                function imageLoaded() {
+                  loadedCount++;
+                  if (loadedCount >= totalPending) {
+                    clearTimeout(timeout);
+                    resolve();
+                  }
+                }
+                
+                pendingImages.forEach(img => {
+                  img.addEventListener('load', imageLoaded);
+                  img.addEventListener('error', imageLoaded);
+                  
+                  if (img.complete) {
+                    imageLoaded();
+                  }
+                });
+              });
+            });
+            
+            const imageInfo = await page.evaluate(() => {
+              const images = Array.from(document.images);
+              return {
+                total: images.length,
+                loaded: images.filter(img => img.complete).length,
+                srcs: images.map(img => img.src).filter(src => src && src.startsWith('http'))
+              };
+            });
+            
+            console.log(`Images: ${imageInfo.loaded}/${imageInfo.total} loaded`);
+            console.log(`Tracked ${imageUrls.size} image requests`);
+            console.log(`Tracked ${fontUrls.size} font requests`);
+            console.log(`Tracked ${cssUrls.size} CSS requests`);
+            
+            await page.screenshot({ 
+              path: `${outputDir}/${baseFilename}_preview.png`, 
+              fullPage: true 
+            });
+            
+            console.log('Downloading and embedding images...');
+            const pageWithEmbeddedImages = await page.evaluate(() => {
+              return new Promise(async (resolve) => {
+                const images = Array.from(document.images);
+                const imageMap = new Map();
+                let processedCount = 0;
+                
+                const embeddingTimeout = setTimeout(() => {
+                  console.log(`Embedding timeout, processed ${processedCount}/${images.length} images`);
+                  resolve(document.documentElement.outerHTML);
+                }, 30000);
+                
+                for (let i = 0; i < images.length; i++) {
+                  const img = images[i];
+                  const src = img.src;
+                  
+                  if (src && (src.startsWith('http') || src.startsWith('data:'))) {
+                    try {
+                      const fetchPromise = fetch(src);
+                      const timeoutPromise = new Promise((_, reject) => 
+                        setTimeout(() => reject(new Error('Image fetch timeout')), 5000)
+                      );
+                      
+                      const response = await Promise.race([fetchPromise, timeoutPromise]);
+                      const blob = await response.blob();
+                      const reader = new FileReader();
+                      
+                      const base64 = await new Promise((resolveReader) => {
+                        reader.onloadend = () => resolveReader(reader.result);
+                        reader.onerror = () => resolveReader(null);
+                        reader.readAsDataURL(blob);
+                      });
+                      
+                      if (base64) {
+                        imageMap.set(src, base64);
+                      }
+                    } catch (e) {
+                      console.warn(`Failed to embed ${src.substring(0, 100)}:`, e.message);
+                    }
+                  }
+                  
+                  processedCount++;
+                  
+                  if (processedCount % 10 === 0) {
+                    console.log(`Processed ${processedCount}/${images.length} images for embedding`);
+                  }
+                }
+                
+                clearTimeout(embeddingTimeout);
+                
+                for (const [originalSrc, base64] of imageMap) {
+                  const escapedSrc = originalSrc.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                  const selector = `img[src="${escapedSrc}"]`;
+                  document.querySelectorAll(selector).forEach(img => {
+                    img.src = base64;
+                  });
+                }
+                
+                resolve(document.documentElement.outerHTML);
+              });
+            });
+            
+            const htmlPath = `${outputDir}/${baseFilename}.html`;
+            fs.writeFileSync(htmlPath, pageWithEmbeddedImages);
+            console.log(`Saved complete HTML to ${htmlPath}`);
+            
+            const client = await page.context().newCDPSession(page);
+            const { data } = await client.send('Page.captureSnapshot', { format: 'mhtml' });
+            const mhtmlPath = `${outputDir}/${baseFilename}.mhtml`;
+            fs.writeFileSync(mhtmlPath, data);
+            console.log(`Saved MHTML backup to ${mhtmlPath}`);
+            
+            const metadata = {
+              url: url,
+              timestamp: new Date().toISOString(),
+              statistics: {
+                imagesTotal: imageInfo.total,
+                imagesLoaded: imageInfo.loaded,
+                imagesTracked: imageUrls.size,
+                fontsTracked: fontUrls.size,
+                cssTracked: cssUrls.size
+              },
+              imageUrls: Array.from(imageUrls),
+              fontUrls: Array.from(fontUrls),
+              cssUrls: Array.from(cssUrls)
+            };
+            
+            fs.writeFileSync(
+              `${outputDir}/${baseFilename}_metadata.json`, 
+              JSON.stringify(metadata, null, 2)
+            );
+            console.log('Saved metadata');
+            
+          } catch (error) {
+            console.error('Error:', error);
+            throw error;
+          } finally {
+            await browser.close();
+          }
+        }
+        
+        const url = process.argv[2];
+        const outputDir = process.argv[3];
+        const baseFilename = process.argv[4];
+        
+        if (!fs.existsSync(outputDir)) {
+          fs.mkdirSync(outputDir, { recursive: true });
+        }
+        
+        scrapeCompletePage(url, outputDir, baseFilename)
+          .then(() => console.log('Scraping completed successfully'))
+          .catch(err => {
+            console.error('Scraping failed:', err);
+            process.exit(1);
+          });
+        EOF
+        
+        node scrape_complete.js "${{ github.event.inputs.webpage_url }}" "scrapper_temp" "${{ steps.vars.outputs.filename }}"
+    
+    - name: Compress to ZIP
+      run: |
+        cd scrapper_temp
+        zip -r "../scrapped/${{ steps.vars.outputs.filename }}.zip" .
+        cd ..
+    
+    - name: Delete scrapper_temp folder
+      run: |
+        rm -rf scrapper_temp
+    
+    - name: Commit and push ZIP file to scrapped folder
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        git pull
+        git add scrapped/${{ steps.vars.outputs.filename }}.zip
+        git commit -m "Add complete scraped webpage to scrapped folder: ${{ github.event.inputs.webpage_url }}" || echo "No changes to commit"
+        git push origin main
